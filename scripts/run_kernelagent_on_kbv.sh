@@ -164,7 +164,7 @@ echo "[jobs] ${#PROBLEM_PATH[@]} problems across levels: ${LEVELS_RUN[*]}"
 export ANTHROPIC_API_KEY="$OPENAI_API_KEY"   # SDK reads this, not ANTHROPIC_AUTH_TOKEN
 export OPENAI_BASE_URL=https://snowhouse.snowflakecomputing.com/api/v2/cortex/v1
 export ANTHROPIC_BASE_URL=https://snowhouse.snowflakecomputing.com/api/v2/cortex/anthropic
-export PYTHONPATH="$KERNELAGENT_DIR:${PYTHONPATH:-}"
+export PYTHONPATH="$KERNELAGENT_DIR:$KBV_DIR${PYTHONPATH:+:$PYTHONPATH}"
 export KBV_DIR
 
 # ---------------------------------------------------------------------------
@@ -221,6 +221,7 @@ for i in "${!PROBLEM_PATH[@]}"; do
             --extract-model "$EXTRACT_MODEL" \
             --dispatch-model "$DISPATCH_MODEL" \
             --compose-model "$COMPOSE_MODEL" \
+            --dtype "$PRECISION" \
             --verify \
             > run.log 2>&1
     ) &
@@ -324,6 +325,7 @@ for level in "${LEVELS_RUN[@]}"; do
             num_cpu_workers=1 \
             precision="$PRECISION" \
             compile="$COMPILE_MODE" \
+            backend=triton \
             measure_performance=True
     )
 done

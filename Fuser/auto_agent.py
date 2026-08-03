@@ -351,7 +351,10 @@ class AutoKernelRouter:
         no_cusolver: bool = False,
         test_timeout_s: int = 30,
         test_code: str | None = None,
+        dtype: str = "bfloat16",
     ) -> None:
+        from Fuser.dtype_util import normalize_dtype_name
+
         self.ka_model = ka_model
         self.ka_num_workers = ka_num_workers
         self.ka_max_rounds = ka_max_rounds
@@ -378,10 +381,16 @@ class AutoKernelRouter:
         self.no_cusolver = no_cusolver
         self.test_timeout_s = test_timeout_s
         self.test_code = test_code
+        self.dtype = normalize_dtype_name(dtype)
 
     def _solve_with_kernelagent(
         self, problem_code: str, test_code: str | None = None
     ) -> RouteResult:
+        from Fuser.dtype_util import dtype_guidance_block
+
+        guided_problem = (
+            dtype_guidance_block(self.dtype) + "\n\n" + problem_code
+        )
         agent = TritonKernelAgent(
             num_workers=self.ka_num_workers,
             max_rounds=self.ka_max_rounds,
@@ -395,7 +404,7 @@ class AutoKernelRouter:
             # Ensure exceptions in KernelAgent do not abort routing; return a structured failure
             try:
                 res = agent.generate_kernel(
-                    problem_description=problem_code, test_code=test_code
+                    problem_description=guided_problem, test_code=test_code
                 )
             except BaseException as exc:
                 return RouteResult(
@@ -455,6 +464,7 @@ class AutoKernelRouter:
                 compose_max_iters=self.compose_max_iters,
                 target_platform=self.platform_config.name,
                 test_timeout_s=self.test_timeout_s,
+                dtype=self.dtype,
             )
         except BaseException as exc:  # catch SystemExit and others
             # Return a structured failure so caller can decide on fallback
@@ -775,6 +785,13 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Disable cuSolver library usage in generated kernels",
     )
+    p.add_argument(
+        "--dtype",
+        "--precision",
+        dest="dtype",
+        default="bfloat16",
+        help="Target activation/weight dtype (float32|float16|bfloat16 or fp32|fp16|bf16)",
+    )
     args = p.parse_args(argv)
 
     # Load environment variables from .env file
@@ -827,6 +844,7 @@ def main(argv: list[str] | None = None) -> int:
             no_cusolver=args.no_cusolver,
             test_timeout_s=args.run_timeout_s,
             test_code=test_code,
+            dtype=args.dtype,
         )
 
     try:

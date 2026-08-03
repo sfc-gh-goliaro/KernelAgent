@@ -27,6 +27,9 @@ compose_max_iters: 5
 verify: true
 dispatch_jobs: 2
 
+# Target activation/weight dtype for generation prompts (bf16|fp16|fp32 aliases ok)
+dtype: bfloat16
+
 # Routing behavior
 allow_fallback: true
 target_platform: cuda

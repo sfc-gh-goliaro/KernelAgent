@@ -58,7 +58,12 @@ def run_pipeline(
     compose_max_iters: int = 5,
     target_platform: str = "cuda",
     test_timeout_s: int = 30,
+    dtype: str = "bfloat16",
 ) -> dict:
+    from .dtype_util import normalize_dtype_name
+
+    default_dtype = normalize_dtype_name(dtype)
+
     # Select default KernelAgent model if not provided: prefer GPT-5 for Level 2/3
     if dispatch_model is None:
         pp = str(problem_path)
@@ -114,6 +119,7 @@ def run_pipeline(
         target_platform=target_platform,
         max_iters=max_iters,
         test_timeout_s=test_timeout_s,
+        dtype=default_dtype,
     )
 
     # Step 3: compose end-to-end
@@ -128,12 +134,14 @@ def run_pipeline(
         verify=verify,
         max_iters=compose_max_iters,
         target_platform=target_platform,
+        dtype=default_dtype,
     )
     return {
         "run_dir": str(run_dir),
         "subgraphs": str(subgraphs_path),
         "kernels_summary": str(summary_path),
         "composition": comp_res,
+        "dtype": default_dtype,
     }
 
 
@@ -176,6 +184,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Target platform",
     )
     p.add_argument("--test-timeout-s", type=int, default=30)
+    p.add_argument(
+        "--dtype",
+        "--precision",
+        dest="dtype",
+        default="bfloat16",
+        help="Target activation/weight dtype (float32|float16|bfloat16 or fp32|fp16|bf16)",
+    )
     args = p.parse_args(argv)
 
     problem_path = Path(args.problem).resolve()
@@ -199,6 +214,7 @@ def main(argv: list[str] | None = None) -> int:
             compose_max_iters=args.compose_max_iters,
             target_platform=args.target_platform,
             test_timeout_s=args.run_timeout_s,
+            dtype=args.dtype,
         )
         print(json.dumps(res, indent=2))
         return 0

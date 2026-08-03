@@ -95,8 +95,21 @@ class AnthropicProvider(BaseProvider):
             self._original_proxy_env = configure_proxy_environment()
 
             base_url = os.environ.get("ANTHROPIC_BASE_URL")
-            self.client = Anthropic(api_key=api_key, base_url=base_url) if base_url \
-                          else Anthropic(api_key=api_key)
+            client_kwargs: dict = {"api_key": api_key}
+            if base_url:
+                client_kwargs["base_url"] = base_url
+            # Match OpenAI snowhouse client: app identity + aggressive 5xx retries.
+            if base_url and "snowhouse" in base_url:
+                from .openai_base import (
+                    _SNOWHOUSE_MAX_RETRIES,
+                    _SNOWHOUSE_TIMEOUT_S,
+                    snowflake_application_headers,
+                )
+
+                client_kwargs["default_headers"] = snowflake_application_headers()
+                client_kwargs["max_retries"] = _SNOWHOUSE_MAX_RETRIES
+                client_kwargs["timeout"] = _SNOWHOUSE_TIMEOUT_S
+            self.client = Anthropic(**client_kwargs)
 
     def get_response(
         self, model_name: str, messages: list[dict[str, str]], **kwargs

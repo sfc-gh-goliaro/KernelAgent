@@ -20,11 +20,27 @@ import logging
 from .base import BaseProvider, LLMResponse
 from .env_config import configure_proxy_environment
 
+logger = logging.getLogger(__name__)
 
-def _reasoning_effort() -> str | None:
-    """User-selected reasoning effort, or None to let the server default."""
+# Snowflake Cortex / snowhouse client identity (mirrors kernelguy's
+# X-SNOWFLAKE-APPLICATION + User-Agent contract).
+_SNOWFLAKE_APP = "kernelagent"
+_SNOWHOUSE_MAX_RETRIES = 12
+_SNOWHOUSE_TIMEOUT_S = 600.0
+
+
+def _reasoning_effort(kwargs: dict[str, Any] | None = None) -> str | None:
+    """User-selected reasoning effort, or None to let the server default.
+
+    Prefers KERNELAGENT_REASONING_EFFORT; falls back to high when the caller
+    passes high_reasoning_effort=True (worker/agent convention).
+    """
     v = os.environ.get("KERNELAGENT_REASONING_EFFORT")
-    return v.strip() or None if v else None
+    if v and v.strip():
+        return v.strip()
+    if kwargs and kwargs.get("high_reasoning_effort"):
+        return "high"
+    return None
 
 
 def _extract_system(messages: list[dict[str, str]]) -> tuple[str | None, list[dict[str, str]]]:
@@ -60,6 +76,41 @@ def _responses_output_text(response: Any) -> str:
                     return getattr(c, "text", "") or ""
     return ""
 
+
+def _collect_streamed_response(stream: Any) -> tuple[str, Any | None]:
+    """Consume a Responses SSE stream; return (text, final Response | None)."""
+    chunks: list[str] = []
+    final = None
+    for event in stream:
+        etype = getattr(event, "type", None)
+        if etype == "response.output_text.delta":
+            delta = getattr(event, "delta", None)
+            if delta:
+                chunks.append(delta)
+        elif etype == "response.completed":
+            final = getattr(event, "response", None)
+        elif etype == "response.failed":
+            resp = getattr(event, "response", None)
+            err = getattr(resp, "error", None) if resp is not None else None
+            msg = getattr(err, "message", None) if err is not None else None
+            raise RuntimeError(msg or "Responses stream failed")
+        elif etype == "error":
+            msg = getattr(event, "message", None) or str(event)
+            raise RuntimeError(f"Responses stream error: {msg}")
+    text = "".join(chunks)
+    if not text and final is not None:
+        text = _responses_output_text(final)
+    return text, final
+
+
+def snowflake_application_headers() -> dict[str, str]:
+    """Headers Snowflake Cortex expects for app identification / routing."""
+    return {
+        "X-SNOWFLAKE-APPLICATION": _SNOWFLAKE_APP,
+        "User-Agent": _SNOWFLAKE_APP,
+    }
+
+
 try:
     from openai import OpenAI
 
@@ -89,11 +140,15 @@ class OpenAICompatibleProvider(BaseProvider):
             # Configure proxy using centralized utility function
             self._original_proxy_env = configure_proxy_environment()
 
-            # Initialize client (proxy configured via environment variables)
+            client_kwargs: dict[str, Any] = {"api_key": api_key}
             if self.base_url:
-                self.client = OpenAI(api_key=api_key, base_url=self.base_url)
-            else:
-                self.client = OpenAI(api_key=api_key)
+                client_kwargs["base_url"] = self.base_url
+            if self._snowhouse:
+                # Match kernelguy: identify as a Cortex app and retry 5xx hard.
+                client_kwargs["default_headers"] = snowflake_application_headers()
+                client_kwargs["max_retries"] = _SNOWHOUSE_MAX_RETRIES
+                client_kwargs["timeout"] = _SNOWHOUSE_TIMEOUT_S
+            self.client = OpenAI(**client_kwargs)
 
     def get_response(
         self, model_name: str, messages: list[dict[str, str]], **kwargs
@@ -103,13 +158,11 @@ class OpenAICompatibleProvider(BaseProvider):
             raise RuntimeError(f"{self.name} client not available")
 
         if self._snowhouse:
-            resp = self.client.responses.create(**self._build_responses_params(model_name, messages, **kwargs))
-            return LLMResponse(content=_responses_output_text(resp), model=model_name, provider=self.name,
-                               usage=resp.usage.model_dump() if getattr(resp, "usage", None) else None)
+            return self._get_snowhouse_response(model_name, messages, **kwargs)
 
         api_params = self._build_api_params(model_name, messages, **kwargs)
         response = self.client.chat.completions.create(**api_params)
-        logging.getLogger(__name__).info(
+        logger.info(
             "OpenAI chat response (single): %s",
             getattr(response, "model_dump", lambda: str(response))(),
         )
@@ -121,6 +174,23 @@ class OpenAICompatibleProvider(BaseProvider):
             usage=response.usage.dict()
             if hasattr(response, "usage") and response.usage
             else None,
+        )
+
+    def _get_snowhouse_response(
+        self, model_name: str, messages: list[dict[str, str]], **kwargs
+    ) -> LLMResponse:
+        """Snowflake Cortex Responses call (streaming, kernelguy-style)."""
+        params = self._build_responses_params(model_name, messages, **kwargs)
+        stream = self.client.responses.create(**params)
+        text, final = _collect_streamed_response(stream)
+        usage = None
+        if final is not None and getattr(final, "usage", None) is not None:
+            usage = final.usage.model_dump()
+        return LLMResponse(
+            content=text,
+            model=model_name,
+            provider=self.name,
+            usage=usage,
         )
 
     def get_multiple_responses(
@@ -135,13 +205,14 @@ class OpenAICompatibleProvider(BaseProvider):
             out = []
             base_t = float(kwargs.get("temperature", 0.7))
             for i in range(max(1, n)):
-                kw = dict(kwargs); kw["temperature"] = base_t + (0.1 * i if n > 1 else 0.0)
+                kw = dict(kwargs)
+                kw["temperature"] = base_t + (0.1 * i if n > 1 else 0.0)
                 out.append(self.get_response(model_name, messages, **kw))
             return out
 
         api_params = self._build_api_params(model_name, messages, n=n, **kwargs)
         response = self.client.chat.completions.create(**api_params)
-        logging.getLogger(__name__).info(
+        logger.info(
             "OpenAI chat response (multi): %s",
             getattr(response, "model_dump", lambda: str(response))(),
         )
@@ -168,13 +239,19 @@ class OpenAICompatibleProvider(BaseProvider):
             "max_output_tokens": min(
                 kwargs.get("max_tokens", 8192), self.get_max_tokens_limit(model_name)
             ),
-            "stream": False,
+            # Stream like kernelguy — more reliable on snowhouse than a single
+            # buffered non-stream response for long GPT-5.x generations.
+            "stream": True,
+            "store": False,
+            "metadata": {"client": _SNOWFLAKE_APP},
+            # Snowflake-specific app tag (also sent as HTTP header).
+            "extra_body": {"client_metadata": {"client": _SNOWFLAKE_APP}},
         }
         if system:
             params["instructions"] = system
-        effort = _reasoning_effort()
+        effort = _reasoning_effort(kwargs)
         if effort:
-            params["reasoning"] = {"effort": effort}
+            params["reasoning"] = {"effort": effort, "summary": "auto"}
         return params
 
     def _build_api_params(
@@ -204,7 +281,7 @@ class OpenAICompatibleProvider(BaseProvider):
             params["n"] = kwargs["n"]
 
         # Only send reasoning_effort when the user explicitly opts in.
-        effort = _reasoning_effort()
+        effort = _reasoning_effort(kwargs)
         if effort and (model_name.startswith("gpt-5") or model_name.startswith(("o1", "o3"))):
             params["reasoning_effort"] = effort
 

@@ -259,12 +259,16 @@ def _build_reference_code(item: dict[str, Any]) -> tuple[str, list[str]]:
 
 
 def _synthesize_problem_description(
-    item: dict[str, Any], target_platform: PlatformConfig
+    item: dict[str, Any],
+    target_platform: PlatformConfig,
+    default_dtype: str = "bfloat16",
 ) -> str:
+    from .dtype_util import dtype_guidance_block, normalize_dtype_name
+
     id_ = str(item.get("id", "unknown"))
     type_ = str(item.get("type", ""))
     layout = item.get("data_layout") or "NCHW"
-    dtype = item.get("dtype") or "float32"
+    dtype = normalize_dtype_name(item.get("dtype") or default_dtype)
     input_shape = item.get("input_shape")
     output_shape = item.get("output_shape")
     inputs_multi = item.get("inputs")
@@ -286,6 +290,8 @@ def _synthesize_problem_description(
         Target Platform: {target_platform.name}
         Device String: {target_platform.device_string}
 
+        {dtype_guidance_block(dtype)}
+
         Shapes:
         - input: {_fmt_shape(inputs_multi[0]) if isinstance(inputs_multi, list) else _fmt_shape(input_shape)}
         {("- input2: " + _fmt_shape(inputs_multi[1])) if isinstance(inputs_multi, list) and len(inputs_multi) > 1 else ""}
@@ -301,7 +307,7 @@ def _synthesize_problem_description(
         - Return a complete Python file with a @triton.jit kernel and a wrapper function named kernel_function(...).
         - kernel_function must accept input tensor(s) and any required weights/bias parameters (match shapes above).
         - Implement the exact semantics of the listed ops in the given order for the provided shapes.
-        - Use {layout} layout and {dtype} dtype semantics.
+        - Use {layout} layout and {dtype} dtype semantics for host tensors (inputs/weights/outputs).
         - Allocate inputs, weights, intermediates, and outputs on device='{target_platform.device_string}' and keep them there throughout forward/verification.
         - CPU is acceptable only for metadata, scalars, and export serialization—avoid `.cpu()` or `.to('cpu')` on compute tensors.
         - The test will import kernel_function and compare to the reference implementation below.
@@ -335,21 +341,27 @@ def run(
     max_iters: int = 10,
     no_cusolver: bool = False,
     test_timeout_s: int = 30,
+    dtype: str = "bfloat16",
 ) -> Path:
     """Dispatch subgraphs to KernelAgent with optional parallelism.
 
     jobs controls the number of concurrent subgraph generations. Default=1
     preserves previous behavior and avoids GPU/LLM contention.
     """
+    from .dtype_util import normalize_dtype_name, stamp_subgraph_dtypes
+
     if TritonKernelAgent is None:
         raise SystemExit(
             "TritonKernelAgent not available. Ensure the package is importable."
         )
 
+    default_dtype = normalize_dtype_name(dtype)
+
     with subgraphs_path.open("r", encoding="utf-8") as f:
         items: list[dict[str, Any]] = json.load(f)
     if not isinstance(items, list):
         raise SystemExit("subgraphs.json must be a JSON array")
+    stamp_subgraph_dtypes(items, default_dtype)
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -360,7 +372,9 @@ def run(
     def _handle_one(idx_item: tuple[int, dict[str, Any]]) -> tuple[int, dict[str, Any]]:
         idx, item = idx_item
         sid = str(item.get("id", f"subgraph_{idx}"))
-        pdesc = _synthesize_problem_description(item, target_platform=platform)
+        pdesc = _synthesize_problem_description(
+            item, target_platform=platform, default_dtype=default_dtype
+        )
         sg_dir = out_dir / sid
         sg_dir.mkdir(parents=True, exist_ok=True)
         (sg_dir / "problem.txt").write_text(pdesc, encoding="utf-8")
@@ -472,6 +486,13 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Disable cuSolver library usage in generated kernels",
     )
+    p.add_argument(
+        "--dtype",
+        "--precision",
+        dest="dtype",
+        default="bfloat16",
+        help="Target activation/weight dtype (float32|float16|bfloat16 or fp32|fp16|bf16)",
+    )
     args = p.parse_args(argv)
 
     subgraphs_path = Path(args.subgraphs).resolve()
@@ -502,6 +523,7 @@ def main(argv: list[str] | None = None) -> int:
         target_platform=args.target_platform,
         no_cusolver=args.no_cusolver,
         test_timeout_s=args.test_timeout_s,
+        dtype=args.dtype,
     )
     print(str(summary_path))
     return 0

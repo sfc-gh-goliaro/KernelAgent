@@ -108,13 +108,18 @@ def _load_kernels_from_summary(summary_path: Path) -> list[KernelItem]:
     return items
 
 
-def _summarize_subgraphs_for_prompt(subgraphs: list[dict[str, Any]]) -> str:
+def _summarize_subgraphs_for_prompt(
+    subgraphs: list[dict[str, Any]], default_dtype: str = "bfloat16"
+) -> str:
+    from .dtype_util import normalize_dtype_name
+
+    default_dtype = normalize_dtype_name(default_dtype)
     lines: list[str] = []
     for it in subgraphs:
         sid = str(it.get("id", "unknown"))
         typ = str(it.get("type", ""))
         layout = it.get("data_layout") or "NCHW"
-        dtype = it.get("dtype") or "float32"
+        dtype = normalize_dtype_name(it.get("dtype") or default_dtype)
         inputs = it.get("inputs")
         in_shape = it.get("input_shape")
         out_shape = it.get("output_shape")
@@ -139,10 +144,14 @@ def _build_composition_prompt(
     subgraphs: list[dict[str, Any]],
     kernel_items: list[KernelItem],
     target_platform: PlatformConfig,
+    default_dtype: str = "bfloat16",
 ) -> str:
     """Create a single user message to instruct composition by the LLM."""
+    from .dtype_util import dtype_guidance_block, normalize_dtype_name
+
+    default_dtype = normalize_dtype_name(default_dtype)
     # Provide a succinct summary of subgraphs up front
-    sg_summary = _summarize_subgraphs_for_prompt(subgraphs)
+    sg_summary = _summarize_subgraphs_for_prompt(subgraphs, default_dtype=default_dtype)
 
     # Include only essential snippets from each kernel to keep token usage sane
     # We include full files for now; callers can trim by model limits.
@@ -166,6 +175,8 @@ def _build_composition_prompt(
         DEVICE STRING: {target_platform.device_string}
         {platform_guidance}
 
+        {dtype_guidance_block(default_dtype)}
+
         Task:
         - Compose an end-to-end Triton implementation that matches the original
           model's forward pass for the provided shapes. You may inline, adapt,
@@ -187,12 +198,13 @@ def _build_composition_prompt(
           sigmoid, etc.) for producing the final result. Using PyTorch for
           reference comparisons is allowed only inside the self-test.
         - Use the data layout and dtype semantics indicated by subgraphs, defaulting
-          to NCHW + float32 if unspecified. Respect stride/padding/dilation/groups,
+          to NCHW + {default_dtype} if unspecified. Respect stride/padding/dilation/groups,
           and exact op order.
         - Numerical equivalence: include a self-test (test_kernel or run_tests)
           that compares your Triton-based result to a PyTorch reference computed
           from the original problem code below (use get_init_inputs() and
-          get_inputs() if present to instantiate the Model). The test must print
+          get_inputs() if present to instantiate the Model). Cast model and inputs
+          to {default_dtype} for the reference comparison. The test must print
           'PASS' on success and exit with code 0. Use allclose with rtol<=1e-3,
           atol<=1e-3 for fp32; for fp16/bf16 allow up to 2e-2.
         - No imports beyond torch, triton, triton.language as tl, and stdlib. No I/O.
@@ -239,8 +251,12 @@ def _build_refinement_prompt(
     previous_code: str,
     error_info: dict[str, str],
     target_platform: PlatformConfig,
+    default_dtype: str = "bfloat16",
 ) -> str:
     """Prompt the LLM to refine the previously produced code based on errors."""
+    from .dtype_util import dtype_guidance_block, normalize_dtype_name
+
+    default_dtype = normalize_dtype_name(default_dtype)
     err_tail = error_info.get("stderr_tail", "")
     out_tail = error_info.get("stdout_tail", "")
 
@@ -252,6 +268,8 @@ def _build_refinement_prompt(
 
         TARGET PLATFORM: {target_platform.name}
         DEVICE STRING: {target_platform.device_string}
+
+        {dtype_guidance_block(default_dtype)}
 
         Requirements remain the same. Additionally:
         - Fix any Triton compilation/runtime errors. For scalar constants in
@@ -275,7 +293,10 @@ def _build_refinement_prompt(
     lines.append("")
     lines.append("ORIGINAL PROBLEM FILE:\n```python\n" + problem_code + "\n```")
     lines.append("")
-    lines.append("SUBGRAPHS (summary):\n" + _summarize_subgraphs_for_prompt(subgraphs))
+    lines.append(
+        "SUBGRAPHS (summary):\n"
+        + _summarize_subgraphs_for_prompt(subgraphs, default_dtype=default_dtype)
+    )
     lines.append("")
     # Keep previous attempt for reference
     lines.append("PREVIOUS_ATTEMPT:\n```python\n" + previous_code + "\n```")
@@ -340,11 +361,16 @@ def compose(
     verify: bool = False,
     max_iters: int = 5,
     target_platform: str = "cuda",
+    dtype: str = "bfloat16",
 ) -> dict[str, Any]:
     if get_model_provider is None:
         raise SystemExit(
             "KernelAgent providers unavailable; ensure package import and dependencies"
         )
+
+    from .dtype_util import normalize_dtype_name, stamp_subgraph_dtypes
+
+    default_dtype = normalize_dtype_name(dtype)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     provider = get_model_provider(model_name)
@@ -357,6 +383,7 @@ def compose(
     subgraphs = json.loads(_read_text(subgraphs_path))
     if not isinstance(subgraphs, list):
         raise SystemExit("subgraphs.json must be a JSON array")
+    stamp_subgraph_dtypes(subgraphs, default_dtype)
     kernels = _load_kernels_from_summary(kernels_summary_path)
 
     attempts_dir = out_dir / "attempts"
@@ -369,7 +396,11 @@ def compose(
     for i in range(1, max_iters + 1):
         if i == 1 or last_code is None:
             prompt = _build_composition_prompt(
-                problem_code, subgraphs, kernels, target_platform=platform
+                problem_code,
+                subgraphs,
+                kernels,
+                target_platform=platform,
+                default_dtype=default_dtype,
             )
         else:
             # Build refinement using previous error info
@@ -401,6 +432,7 @@ def compose(
                 previous_code=last_code,
                 error_info={"stderr_tail": stderr_tail, "stdout_tail": stdout_tail},
                 target_platform=platform,
+                default_dtype=default_dtype,
             )
 
         (attempts_dir / f"attempt_{i}.prompt.txt").write_text(prompt, encoding="utf-8")
@@ -498,6 +530,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Target platform (default: cuda)",
     )
     p.add_argument("--max-iters", type=int, default=5, help="Max LLM refinement rounds")
+    p.add_argument(
+        "--dtype",
+        "--precision",
+        dest="dtype",
+        default="bfloat16",
+        help="Target activation/weight dtype (float32|float16|bfloat16 or fp32|fp16|bf16)",
+    )
     args = p.parse_args(argv)
 
     problem_path = Path(args.problem).resolve()
@@ -525,6 +564,7 @@ def main(argv: list[str] | None = None) -> int:
             verify=args.verify,
             max_iters=args.max_iters,
             target_platform=args.target_platform,
+            dtype=args.dtype,
         )
         print(json.dumps(res, indent=2))
         return 0

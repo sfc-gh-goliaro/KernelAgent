@@ -426,9 +426,11 @@ if __name__ == "__main__":
 
             except Exception as e:
                 self.logger.error(f"Error generating kernels with LLM API: {e}")
-                # Fall back to mock implementation
+                # Do not fall back to mock kernels when a provider is configured —
+                # that produces junk seeds and burns verification rounds.
+                raise
 
-        # Mock kernel generation (fallback)
+        # Offline / no-provider fallback (tests only).
         self.logger.info(f"Generating {num_seeds} kernel seeds (mock implementation)")
 
         kernels = []

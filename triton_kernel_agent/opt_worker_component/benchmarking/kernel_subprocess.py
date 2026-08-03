@@ -210,6 +210,16 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default="bfloat16",
         choices=["float32", "float16", "bfloat16"],
+        help="Activation/weight dtype for loading the problem (default: bfloat16)",
+    )
+    parser.add_argument(
+        "--infer-dtype-from-source",
+        action="store_true",
+        help=(
+            "Optionally override --dtype using explicit torch.<dtype> tokens in "
+            "the kernel source. Does not match tl.float32 accumulators. "
+            "Off by default so CLI/pipeline precision is honored."
+        ),
     )
     parser.add_argument("--json", type=Path, help="Save results to JSON file")
     parser.add_argument("--quiet", action="store_true")
@@ -426,17 +436,24 @@ def main():
         "bfloat16": torch.bfloat16,
     }[args.dtype]
 
-    # Auto-detect dtype from kernel source (matches NCU wrapper's dtype inference)
-    try:
-        kernel_source = args.kernel.read_text()
-        if "bfloat16" in kernel_source.lower():
-            dtype = torch.bfloat16
-        elif "float16" in kernel_source.lower() or "half" in kernel_source.lower():
-            dtype = torch.float16
-        elif "float32" in kernel_source.lower():
-            dtype = torch.float32
-    except Exception:
-        pass
+    # Optional: infer host-tensor dtype from explicit torch.* tokens only.
+    # Disabled by default — bare "float32" (e.g. tl.float32 accumulators) must
+    # not override the CLI/pipeline dtype.
+    if getattr(args, "infer_dtype_from_source", False):
+        try:
+            import re as _re
+
+            kernel_source = args.kernel.read_text()
+            if _re.search(r"\btorch\.bfloat16\b", kernel_source):
+                dtype = torch.bfloat16
+            elif _re.search(r"\btorch\.float16\b", kernel_source) or _re.search(
+                r"\btorch\.half\b", kernel_source
+            ):
+                dtype = torch.float16
+            elif _re.search(r"\btorch\.float32\b", kernel_source):
+                dtype = torch.float32
+        except Exception:
+            pass
 
     if not args.quiet:
         print("=" * 80)

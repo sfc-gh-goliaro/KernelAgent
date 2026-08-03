@@ -40,16 +40,17 @@ inputs = get_inputs()
 init_inputs = get_init_inputs()
 
 {% if dtype_inference %}
-# Infer required dtype from kernel function signature/docstring
+# Infer required *host* dtype from explicit torch.<dtype> tokens only.
+# Do NOT match tl.float32 / bare "float32" (those are usually accumulators).
 required_dtype = None
 try:
-    # Try to get dtype from kernel function docstring or source
+    import re as _re
     kernel_source = inspect.getsource(kernel_function)
-    if 'bfloat16' in kernel_source.lower():
+    if _re.search(r'\btorch\.bfloat16\b', kernel_source):
         required_dtype = torch.bfloat16
-    elif 'float16' in kernel_source.lower() or 'half' in kernel_source.lower():
+    elif _re.search(r'\btorch\.float16\b', kernel_source) or _re.search(r'\btorch\.half\b', kernel_source):
         required_dtype = torch.float16
-    elif 'float32' in kernel_source.lower():
+    elif _re.search(r'\btorch\.float32\b', kernel_source):
         required_dtype = torch.float32
 except Exception:
     pass

@@ -455,10 +455,13 @@ class VerificationWorker:
             except Exception as e:
                 if "Malformed LLM kernel response" in str(e):
                     raise
+                # Do not fall back to a mock kernel: that burns a verification
+                # round on a no-op edit. Surface the API error so retries /
+                # upstream handling can decide (kernelguy-style Transient).
                 self.logger.error(f"Error refining kernel with LLM API: {e}")
-                # Fall back to mock refinement
+                raise
 
-        # Mock refinement (fallback)
+        # Offline / no-provider fallback (tests only).
         self.logger.info("Refining kernel (mock implementation)")
 
         # For testing, make a simple modification
