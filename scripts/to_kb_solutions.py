@@ -81,11 +81,17 @@ def main():
     p.add_argument("--level", type=int, required=True, choices=[1, 2, 3, 4])
     p.add_argument("--runs_dir", default=str(kbv / "runs"))
     p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--pids", default="",
+                   help="Optional comma-separated problem ids to import (default: all)")
     args = p.parse_args()
 
     src = Path(args.ka_out) / f"level_{args.level}"
     dst = Path(args.runs_dir) / args.run_name
     dst.mkdir(parents=True, exist_ok=True)
+
+    allow = None
+    if args.pids.strip():
+        allow = {int(x) for x in args.pids.replace(",", " ").split() if x.strip()}
 
     n_ok = n_missing = n_skip = 0
     for problem_dir in sorted(src.iterdir()):
@@ -93,6 +99,8 @@ def main():
         if not m or not problem_dir.is_dir():
             continue
         pid = int(m.group(1))
+        if allow is not None and pid not in allow:
+            continue
         winner = find_winning_kernel(problem_dir)
         if winner is None:
             print(f"[skip] {problem_dir.name}: no winning kernel")
