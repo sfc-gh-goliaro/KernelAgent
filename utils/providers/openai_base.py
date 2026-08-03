@@ -14,10 +14,51 @@
 
 """Base provider for OpenAI-compatible APIs."""
 
+import os
 from typing import Any
 import logging
 from .base import BaseProvider, LLMResponse
 from .env_config import configure_proxy_environment
+
+
+def _reasoning_effort() -> str | None:
+    """User-selected reasoning effort, or None to let the server default."""
+    v = os.environ.get("KERNELAGENT_REASONING_EFFORT")
+    return v.strip() or None if v else None
+
+
+def _extract_system(messages: list[dict[str, str]]) -> tuple[str | None, list[dict[str, str]]]:
+    sys_chunks, body = [], []
+    for m in messages:
+        if m.get("role") == "system":
+            c = m.get("content", "")
+            if isinstance(c, str) and c:
+                sys_chunks.append(c)
+        else:
+            body.append(m)
+    return ("\n\n".join(sys_chunks) if sys_chunks else None), body
+
+
+def _to_responses_input(body_messages: list[dict[str, str]]) -> list[dict[str, Any]]:
+    out = []
+    for m in body_messages:
+        role = m["role"]
+        text = m.get("content", "") or ""
+        block_type = "output_text" if role == "assistant" else "input_text"
+        out.append({"role": role, "content": [{"type": block_type, "text": text}]})
+    return out
+
+
+def _responses_output_text(response: Any) -> str:
+    text = getattr(response, "output_text", None)
+    if text:
+        return text
+    for item in getattr(response, "output", None) or []:
+        if getattr(item, "type", None) == "message":
+            for c in getattr(item, "content", None) or []:
+                if getattr(c, "type", None) == "output_text":
+                    return getattr(c, "text", "") or ""
+    return ""
 
 try:
     from openai import OpenAI
@@ -33,7 +74,8 @@ class OpenAICompatibleProvider(BaseProvider):
 
     def __init__(self, api_key_env: str, base_url: str | None = None):
         self.api_key_env = api_key_env
-        self.base_url = base_url
+        self.base_url = base_url or os.environ.get("OPENAI_BASE_URL")
+        self._snowhouse = bool(self.base_url and "snowhouse" in self.base_url)
         self._original_proxy_env = None
         super().__init__()
 
@@ -60,6 +102,11 @@ class OpenAICompatibleProvider(BaseProvider):
         if not self.is_available():
             raise RuntimeError(f"{self.name} client not available")
 
+        if self._snowhouse:
+            resp = self.client.responses.create(**self._build_responses_params(model_name, messages, **kwargs))
+            return LLMResponse(content=_responses_output_text(resp), model=model_name, provider=self.name,
+                               usage=resp.usage.model_dump() if getattr(resp, "usage", None) else None)
+
         api_params = self._build_api_params(model_name, messages, **kwargs)
         response = self.client.chat.completions.create(**api_params)
         logging.getLogger(__name__).info(
@@ -83,6 +130,15 @@ class OpenAICompatibleProvider(BaseProvider):
         if not self.is_available():
             raise RuntimeError(f"{self.name} client not available")
 
+        if self._snowhouse:
+            # Responses API doesn't support n; loop with temperature bump.
+            out = []
+            base_t = float(kwargs.get("temperature", 0.7))
+            for i in range(max(1, n)):
+                kw = dict(kwargs); kw["temperature"] = base_t + (0.1 * i if n > 1 else 0.0)
+                out.append(self.get_response(model_name, messages, **kw))
+            return out
+
         api_params = self._build_api_params(model_name, messages, n=n, **kwargs)
         response = self.client.chat.completions.create(**api_params)
         logging.getLogger(__name__).info(
@@ -101,6 +157,25 @@ class OpenAICompatibleProvider(BaseProvider):
             )
             for choice in response.choices
         ]
+
+    def _build_responses_params(
+        self, model_name: str, messages: list[dict[str, str]], **kwargs
+    ) -> dict[str, Any]:
+        system, body = _extract_system(messages)
+        params: dict[str, Any] = {
+            "model": model_name,
+            "input": _to_responses_input(body),
+            "max_output_tokens": min(
+                kwargs.get("max_tokens", 8192), self.get_max_tokens_limit(model_name)
+            ),
+            "stream": False,
+        }
+        if system:
+            params["instructions"] = system
+        effort = _reasoning_effort()
+        if effort:
+            params["reasoning"] = {"effort": effort}
+        return params
 
     def _build_api_params(
         self, model_name: str, messages: list[dict[str, str]], **kwargs
@@ -128,13 +203,10 @@ class OpenAICompatibleProvider(BaseProvider):
         if "n" in kwargs:
             params["n"] = kwargs["n"]
 
-        # Auto-enable high reasoning for GPT-5
-        if model_name.startswith("gpt-5"):
-            params["reasoning_effort"] = "high"
-        elif kwargs.get("high_reasoning_effort") and model_name.startswith(
-            ("o3", "o1")
-        ):
-            params["reasoning_effort"] = "high"
+        # Only send reasoning_effort when the user explicitly opts in.
+        effort = _reasoning_effort()
+        if effort and (model_name.startswith("gpt-5") or model_name.startswith(("o1", "o3"))):
+            params["reasoning_effort"] = effort
 
         return params
 

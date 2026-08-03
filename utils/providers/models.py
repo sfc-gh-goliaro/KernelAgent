@@ -69,13 +69,18 @@ def get_model_provider(
     """
     model_name_to_config = _get_model_name_to_config()
     if model_name not in model_name_to_config:
-        # Default to RelayProvider for unknown models
-        from .relay_provider import RelayProvider
-
+        # Route unknown models by name prefix: claude-* -> Anthropic, else OpenAI.
+        m = model_name.lower()
+        if m.startswith(("claude", "anthropic-")):
+            from .anthropic_provider import AnthropicProvider
+            provider_classes = [AnthropicProvider]
+        else:
+            from .openai_provider import OpenAIProvider
+            provider_classes = [OpenAIProvider]
         model_config = ModelConfig(
             name=model_name,
-            provider_classes=[RelayProvider],
-            description=f"Unknown model '{model_name}' (defaulting to Relay)",
+            provider_classes=provider_classes,
+            description=f"Unknown model '{model_name}' (routed by prefix)",
         )
     else:
         model_config = model_name_to_config[model_name]
