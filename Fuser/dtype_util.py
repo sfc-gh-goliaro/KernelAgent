@@ -18,25 +18,40 @@ from __future__ import annotations
 
 import re
 
-# CLI / env aliases → canonical prompt/API names used throughout Fuser.
+# CLI / env / extractor aliases → canonical prompt/API names used throughout Fuser.
 DTYPE_ALIASES: dict[str, str] = {
     "fp32": "float32",
     "float32": "float32",
+    "torch.float32": "float32",
+    "torch.float": "float32",
     "fp16": "float16",
     "float16": "float16",
     "half": "float16",
+    "torch.float16": "float16",
+    "torch.half": "float16",
     "bf16": "bfloat16",
     "bfloat16": "bfloat16",
+    "torch.bfloat16": "bfloat16",
 }
 
 CANONICAL_DTYPES = ("float32", "float16", "bfloat16")
 
 
 def normalize_dtype_name(value: str | None, *, default: str = "bfloat16") -> str:
-    """Normalize a user/pipeline dtype string to float32|float16|bfloat16."""
+    """Normalize a user/pipeline/extractor dtype string to float32|float16|bfloat16.
+
+    Accepts bare names (``bf16``, ``float32``), ``torch.*`` forms from the
+    subgraph extractor (``torch.float32``), and common aliases.
+    """
     if value is None or str(value).strip() == "":
         value = default
     key = str(value).strip().lower()
+    # Tolerate accidental wrappers: "<class 'torch.float32'>", "dtype=torch.bfloat16"
+    key = key.replace("<class '", "").replace("'>", "")
+    if "torch." in key and key not in DTYPE_ALIASES:
+        m = re.search(r"torch\.(bfloat16|float16|float32|float|half)\b", key)
+        if m:
+            key = f"torch.{m.group(1)}"
     if key not in DTYPE_ALIASES:
         raise ValueError(
             f"Unsupported dtype {value!r}. Expected one of: "
@@ -60,13 +75,21 @@ def dtype_guidance_block(dtype: str) -> str:
 
 
 def stamp_subgraph_dtypes(
-    items: list[dict], default_dtype: str
+    items: list[dict], default_dtype: str, *, force_pipeline_dtype: bool = True
 ) -> list[dict]:
-    """Fill missing subgraph dtype fields with the pipeline default."""
+    """Apply pipeline dtype to subgraphs.
+
+    By default, overwrite extractor dtypes (often ``torch.float32`` from the
+    reference problem) with the pipeline PRECISION so generation matches KBV eval.
+    Set ``force_pipeline_dtype=False`` to only fill missing fields.
+    """
     default_dtype = normalize_dtype_name(default_dtype)
     for item in items:
-        if not item.get("dtype"):
+        raw = item.get("dtype")
+        if force_pipeline_dtype or not raw:
             item["dtype"] = default_dtype
+        else:
+            item["dtype"] = normalize_dtype_name(raw, default=default_dtype)
     return items
 
 

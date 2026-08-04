@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 # Full KernelAgent → kernel_bench_verified pipeline:
+#   0) Optional --clear of prior OUT_DIR / KBV results+runs+leaderboard
 #   1) Run Fuser.auto_agent (one problem per GPU, refill when free)
 #   2) Import winning kernels into runs/{RUN_NAME}/
 #   3) Generate baseline times if missing for the selected problems
 #   4) Evaluate with eval_from_generations.py
 #   5) Generate leaderboard.html
+#
+# Usage:
+#   DSTAR=1 ./scripts/run_kernelagent_on_kbv.sh
+#   DSTAR=1 ./scripts/run_kernelagent_on_kbv.sh --clear
 #
 # Each problem runs in its own working directory:
 #     $OUT_DIR/level_$LEVEL/${problem_name}/
@@ -12,6 +17,36 @@
 #         .fuse/<run_id>/compose_out/composed_kernel.py           (Fuser route)
 
 set -euo pipefail
+
+# ---- CLI flags ----
+CLEAR=0
+for arg in "$@"; do
+    case "$arg" in
+        --clear)
+            CLEAR=1
+            ;;
+        -h|--help)
+            cat <<'EOF'
+Usage: run_kernelagent_on_kbv.sh [--clear]
+
+  --clear   Delete prior artifacts before starting:
+              $OUT_DIR (kernelagent-runs)
+              $KBV_DIR/results
+              $KBV_DIR/runs
+              $KBV_DIR/leaderboard.html (or $LEADERBOARD_OUT)
+
+Environment knobs: LEVEL, MAX_PROBLEMS, DSTAR, PRECISION, COMPILE, GPUS,
+  OUT_DIR, KBV_DIR, KA_MODEL, EXTRACT_MODEL, DISPATCH_MODEL, COMPOSE_MODEL,
+  LEADERBOARD_OUT.
+EOF
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $arg (try --help)" >&2
+            exit 2
+            ;;
+    esac
+done
 
 # ---- user knobs (override via env) ----
 LEVEL=${LEVEL:-1}                              # one or more levels, e.g. 1 or "1,2,3"
@@ -36,6 +71,29 @@ KBV_DIR=${KBV_DIR:-$(cd "$KERNELAGENT_DIR/../kernel_bench_verified" && pwd)}
 PROBLEMS_ROOT=$KBV_DIR/KernelBench
 OUT_DIR=${OUT_DIR:-$(cd "$KERNELAGENT_DIR/.." && pwd)/kernelagent-runs}
 LEADERBOARD_OUT=${LEADERBOARD_OUT:-$KBV_DIR/leaderboard.html}
+
+if [[ "$CLEAR" == "1" ]]; then
+    echo "[clear] removing prior artifacts"
+    # Guard against empty / root paths from misconfigured env.
+    for path in "$OUT_DIR" "$KBV_DIR/results" "$KBV_DIR/runs"; do
+        if [[ -z "$path" || "$path" == "/" ]]; then
+            echo "[clear] refusing to delete unsafe path: '$path'" >&2
+            exit 1
+        fi
+        if [[ -e "$path" ]]; then
+            echo "[clear] rm -rf $path"
+            rm -rf "$path"
+        else
+            echo "[clear] skip (missing): $path"
+        fi
+    done
+    if [[ -n "$LEADERBOARD_OUT" && "$LEADERBOARD_OUT" != "/" && -e "$LEADERBOARD_OUT" ]]; then
+        echo "[clear] rm -f $LEADERBOARD_OUT"
+        rm -f "$LEADERBOARD_OUT"
+    else
+        echo "[clear] skip (missing): $LEADERBOARD_OUT"
+    fi
+fi
 
 if [[ -z "${COMPILE}" || "${COMPILE}" == "eager" ]]; then
     COMPILE_MODE=eager

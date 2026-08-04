@@ -28,10 +28,13 @@ class OpenAIProvider(OpenAICompatibleProvider):
         return "openai"
 
     def get_max_tokens_limit(self, model_name: str) -> int:
-        """Get max tokens limit for OpenAI models."""
-        if model_name.startswith(("gpt-5", "gpt-4", "o3", "o1")):
+        """Get max tokens limit for OpenAI / Cortex-prefixed models."""
+        from .openai_base import _is_gpt5_family, _model_slug
+
+        slug = _model_slug(model_name)
+        if _is_gpt5_family(model_name) or slug.startswith(("gpt-4", "o3", "o1", "o4")):
             return 32000
-        elif model_name.startswith("gpt-3.5"):
+        elif slug.startswith("gpt-3.5"):
             return 16000
         else:
             return 8192

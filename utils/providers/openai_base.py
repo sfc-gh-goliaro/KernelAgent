@@ -27,6 +27,25 @@ logger = logging.getLogger(__name__)
 _SNOWFLAKE_APP = "kernelagent"
 _SNOWHOUSE_MAX_RETRIES = 12
 _SNOWHOUSE_TIMEOUT_S = 600.0
+_SNOWHOUSE_EMPTY_RETRIES = 3
+
+
+def _model_slug(model_name: str) -> str:
+    """Normalize vendor-prefixed Cortex names (e.g. openai-gpt-5.5 → gpt-5.5)."""
+    m = (model_name or "").strip().lower()
+    for prefix in ("openai-", "azure-", "snowflake-"):
+        if m.startswith(prefix):
+            m = m[len(prefix) :]
+    return m
+
+
+def _is_reasoning_model(model_name: str) -> bool:
+    m = _model_slug(model_name)
+    return m.startswith(("gpt-5", "o1", "o3", "o4"))
+
+
+def _is_gpt5_family(model_name: str) -> bool:
+    return "gpt-5" in _model_slug(model_name)
 
 
 def _reasoning_effort(kwargs: dict[str, Any] | None = None) -> str | None:
@@ -69,16 +88,38 @@ def _responses_output_text(response: Any) -> str:
     text = getattr(response, "output_text", None)
     if text:
         return text
+    parts: list[str] = []
     for item in getattr(response, "output", None) or []:
-        if getattr(item, "type", None) == "message":
-            for c in getattr(item, "content", None) or []:
-                if getattr(c, "type", None) == "output_text":
-                    return getattr(c, "text", "") or ""
-    return ""
+        if getattr(item, "type", None) != "message":
+            continue
+        for c in getattr(item, "content", None) or []:
+            ctype = getattr(c, "type", None)
+            if ctype in ("output_text", "text"):
+                t = getattr(c, "text", None) or ""
+                if t:
+                    parts.append(t)
+    return "".join(parts)
+
+
+def _message_text_from_item(item: Any) -> str:
+    if item is None or getattr(item, "type", None) != "message":
+        return ""
+    parts: list[str] = []
+    for c in getattr(item, "content", None) or []:
+        if getattr(c, "type", None) in ("output_text", "text"):
+            t = getattr(c, "text", None) or ""
+            if t:
+                parts.append(t)
+    return "".join(parts)
 
 
 def _collect_streamed_response(stream: Any) -> tuple[str, Any | None]:
-    """Consume a Responses SSE stream; return (text, final Response | None)."""
+    """Consume a Responses SSE stream; return (text, final Response | None).
+
+    Collects ``response.output_text.delta`` and falls back to message text on
+    ``response.output_item.done`` / ``response.completed`` / ``response.incomplete``
+    (kernelguy also reconstructs text from output_item.done when deltas are absent).
+    """
     chunks: list[str] = []
     final = None
     for event in stream:
@@ -87,8 +128,18 @@ def _collect_streamed_response(stream: Any) -> tuple[str, Any | None]:
             delta = getattr(event, "delta", None)
             if delta:
                 chunks.append(delta)
-        elif etype == "response.completed":
-            final = getattr(event, "response", None)
+        elif etype == "response.output_item.done":
+            # Prefer deltas when present; otherwise take full message text.
+            item_text = _message_text_from_item(getattr(event, "item", None))
+            if item_text and not chunks:
+                chunks.append(item_text)
+            elif item_text and chunks and item_text.startswith("".join(chunks)):
+                # Suffix only if final item is a superset of streamed deltas.
+                suffix = item_text[len("".join(chunks)) :]
+                if suffix:
+                    chunks.append(suffix)
+        elif etype in ("response.completed", "response.incomplete"):
+            final = getattr(event, "response", None) or final
         elif etype == "response.failed":
             resp = getattr(event, "response", None)
             err = getattr(resp, "error", None) if resp is not None else None
@@ -180,17 +231,68 @@ class OpenAICompatibleProvider(BaseProvider):
         self, model_name: str, messages: list[dict[str, str]], **kwargs
     ) -> LLMResponse:
         """Snowflake Cortex Responses call (streaming, kernelguy-style)."""
-        params = self._build_responses_params(model_name, messages, **kwargs)
-        stream = self.client.responses.create(**params)
-        text, final = _collect_streamed_response(stream)
-        usage = None
-        if final is not None and getattr(final, "usage", None) is not None:
-            usage = final.usage.model_dump()
-        return LLMResponse(
-            content=text,
-            model=model_name,
-            provider=self.name,
-            usage=usage,
+        last_meta: dict[str, Any] = {}
+        for attempt in range(1, _SNOWHOUSE_EMPTY_RETRIES + 1):
+            params = self._build_responses_params(model_name, messages, **kwargs)
+            # On empty-content retries, drop reasoning summary pressure a bit by
+            # requesting more output budget if the caller asked for a small cap.
+            if attempt > 1:
+                cur = int(params.get("max_output_tokens") or 8192)
+                params["max_output_tokens"] = max(cur, min(cur * 2, 32000))
+                logger.warning(
+                    "Snowhouse empty/incomplete content retry %s/%s "
+                    "(max_output_tokens=%s)",
+                    attempt,
+                    _SNOWHOUSE_EMPTY_RETRIES,
+                    params["max_output_tokens"],
+                )
+
+            stream = self.client.responses.create(**params)
+            text, final = _collect_streamed_response(stream)
+            usage = None
+            status = None
+            incomplete = None
+            if final is not None:
+                status = getattr(final, "status", None)
+                incomplete = getattr(final, "incomplete_details", None)
+                if getattr(final, "usage", None) is not None:
+                    usage = final.usage.model_dump()
+
+            last_meta = {
+                "status": status,
+                "incomplete_details": incomplete,
+                "usage": usage,
+                "text_len": len(text or ""),
+            }
+
+            if text and text.strip():
+                if status == "incomplete":
+                    logger.warning(
+                        "Snowhouse response incomplete but has content "
+                        "(details=%s usage=%s)",
+                        incomplete,
+                        usage,
+                    )
+                return LLMResponse(
+                    content=text,
+                    model=model_name,
+                    provider=self.name,
+                    usage=usage,
+                )
+
+            logger.warning(
+                "Snowhouse returned empty content (attempt %s/%s): status=%s "
+                "incomplete=%s usage=%s",
+                attempt,
+                _SNOWHOUSE_EMPTY_RETRIES,
+                status,
+                incomplete,
+                usage,
+            )
+
+        raise RuntimeError(
+            "Snowhouse Responses returned empty content after "
+            f"{_SNOWHOUSE_EMPTY_RETRIES} attempts: {last_meta}"
         )
 
     def get_multiple_responses(
@@ -233,12 +335,15 @@ class OpenAICompatibleProvider(BaseProvider):
         self, model_name: str, messages: list[dict[str, str]], **kwargs
     ) -> dict[str, Any]:
         system, body = _extract_system(messages)
+        # Reasoning models need headroom beyond the visible answer; Cortex
+        # model ids are often vendor-prefixed (openai-gpt-5.5), so use the
+        # provider limit helper which understands those names.
+        requested = kwargs.get("max_tokens", 24000)
+        max_out = min(int(requested), self.get_max_tokens_limit(model_name))
         params: dict[str, Any] = {
             "model": model_name,
             "input": _to_responses_input(body),
-            "max_output_tokens": min(
-                kwargs.get("max_tokens", 8192), self.get_max_tokens_limit(model_name)
-            ),
+            "max_output_tokens": max_out,
             # Stream like kernelguy — more reliable on snowhouse than a single
             # buffered non-stream response for long GPT-5.x generations.
             "stream": True,
@@ -264,14 +369,14 @@ class OpenAICompatibleProvider(BaseProvider):
         }
 
         # GPT-5 and o-series models pin their own sampling behaviour
-        if not (model_name.startswith("gpt-5") or model_name.startswith("o")):
+        if not (_is_gpt5_family(model_name) or _model_slug(model_name).startswith("o")):
             params["temperature"] = kwargs.get("temperature", 0.7)
 
         # Use max_completion_tokens for newer models like GPT-5, fallback to max_tokens
         max_tokens_value = min(
             kwargs.get("max_tokens", 8192), self.get_max_tokens_limit(model_name)
         )
-        if model_name.startswith("gpt-5") or model_name.startswith("o"):
+        if _is_gpt5_family(model_name) or _model_slug(model_name).startswith("o"):
             params["max_completion_tokens"] = max_tokens_value
         else:
             params["max_tokens"] = max_tokens_value
@@ -282,7 +387,7 @@ class OpenAICompatibleProvider(BaseProvider):
 
         # Only send reasoning_effort when the user explicitly opts in.
         effort = _reasoning_effort(kwargs)
-        if effort and (model_name.startswith("gpt-5") or model_name.startswith(("o1", "o3"))):
+        if effort and _is_reasoning_model(model_name):
             params["reasoning_effort"] = effort
 
         return params
