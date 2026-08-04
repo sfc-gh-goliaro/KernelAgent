@@ -245,7 +245,7 @@ class TritonKernelAgent:
 
                 # Call LLM API
                 messages = [{"role": "user", "content": prompt}]
-                response_text = self._call_llm(messages, max_tokens=24000)
+                response_text = self._call_llm(messages, max_tokens=32000)
                 self.logger.info("Raw test generation response:\n%s", response_text)
 
                 # Extract test code from response
@@ -369,7 +369,7 @@ if __name__ == "__main__":
                 messages = [{"role": "user", "content": prompt}]
 
                 # Use provider's multiple response capability
-                max_completion_tokens = 20000
+                max_completion_tokens = 32000
 
                 if self.provider.supports_multiple_completions():
                     # Provider supports native multiple completions

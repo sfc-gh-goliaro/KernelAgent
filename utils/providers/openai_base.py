@@ -338,7 +338,7 @@ class OpenAICompatibleProvider(BaseProvider):
         # Reasoning models need headroom beyond the visible answer; Cortex
         # model ids are often vendor-prefixed (openai-gpt-5.5), so use the
         # provider limit helper which understands those names.
-        requested = kwargs.get("max_tokens", 24000)
+        requested = kwargs.get("max_tokens", 32000)
         max_out = min(int(requested), self.get_max_tokens_limit(model_name))
         params: dict[str, Any] = {
             "model": model_name,
